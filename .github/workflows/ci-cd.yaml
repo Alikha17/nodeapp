@@ -1,0 +1,127 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: nodeapp
+  AWS_ROLE_ARN: arn:aws:iam::533267107402:role/github-actions-nodeapp
+  EKS_CLUSTER: my-eks-cluster
+  NAMESPACE: nodeapp
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  ci:
+    name: Test, Sonar, Nexus
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Configure npm to use Nexus
+        env:
+          GROUP_URL: ${{ secrets.NEXUS_NPM_GROUP_URL }}
+          HOSTED_URL: ${{ secrets.NEXUS_NPM_HOSTED_URL }}
+          NEXUS_TOKEN: ${{ secrets.NEXUS_NPM_TOKEN }}
+        run: |
+          {
+            echo "registry=${GROUP_URL}"
+            echo "//${GROUP_URL#*://}:_auth=${NEXUS_TOKEN}"
+            echo "//${HOSTED_URL#*://}:_auth=${NEXUS_TOKEN}"
+            echo "always-auth=true"
+          } > ~/.npmrc
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: SonarQube quality gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Publish package to Nexus
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          npm version 1.0.${{ github.run_number }} --no-git-tag-version
+          npm publish --registry ${{ secrets.NEXUS_NPM_HOSTED_URL }}
+
+  build:
+    name: Build and push to ECR
+    needs: ci
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+      registry: ${{ steps.ecr.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          docker build -t $IMAGE:${{ steps.meta.outputs.tag }} .
+          docker push $IMAGE:${{ steps.meta.outputs.tag }}
+
+  deploy:
+    name: Deploy to EKS with Helm
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Helm upgrade
+        run: |
+          helm upgrade --install nodeapp ./helm/nodeapp \
+            --namespace ${{ env.NAMESPACE }} --create-namespace \
+            --set image.repository=${{ needs.build.outputs.registry }}/${{ env.ECR_REPOSITORY }} \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --atomic --timeout 5m
